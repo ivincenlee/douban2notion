@@ -1,8 +1,10 @@
 import logging
 import os
 import re
+import time
 
 from notion_client import Client
+from notion_client.errors import APIErrorCode, APIResponseError
 from retrying import retry
 
 from douban2notion.utils import (
@@ -20,6 +22,56 @@ TAG_ICON_URL = "https://www.notion.so/icons/tag_gray.svg"
 USER_ICON_URL = "https://www.notion.so/icons/user-circle-filled_gray.svg"
 TARGET_ICON_URL = "https://www.notion.so/icons/target_red.svg"
 BOOKMARK_ICON_URL = "https://www.notion.so/icons/bookmark_gray.svg"
+NOTION_REQUESTS_PER_SECOND = 3.0
+NOTION_RATE_LIMIT_MAX_RETRIES = 10
+NOTION_RATE_LIMIT_MAX_WAIT_SECONDS = 60.0
+
+
+def _rate_limit_wait_seconds(error, attempt):
+    retry_after = (getattr(error, "headers", None) or {}).get("Retry-After")
+    try:
+        wait_seconds = float(retry_after)
+    except (TypeError, ValueError):
+        wait_seconds = float(2**attempt)
+    return min(max(wait_seconds, 0.05), NOTION_RATE_LIMIT_MAX_WAIT_SECONDS)
+
+
+class RateLimitedNotionClient(Client):
+    """Keep Notion writes below the API limit and retry sustained 429s."""
+
+    def __init__(
+        self,
+        *,
+        min_request_interval=1.0 / NOTION_REQUESTS_PER_SECOND,
+        max_rate_limit_retries=NOTION_RATE_LIMIT_MAX_RETRIES,
+        **kwargs,
+    ):
+        self._min_request_interval = max(float(min_request_interval), 0.0)
+        self._max_rate_limit_retries = max(int(max_rate_limit_retries), 0)
+        self._last_request_at = float("-inf")
+        super().__init__(**kwargs)
+
+    def _wait_for_request_slot(self):
+        now = time.monotonic()
+        wait_seconds = self._min_request_interval - (now - self._last_request_at)
+        if wait_seconds > 0:
+            time.sleep(wait_seconds)
+            now += wait_seconds
+        self._last_request_at = now
+
+    def request(self, *args, **kwargs):
+        for attempt in range(self._max_rate_limit_retries + 1):
+            self._wait_for_request_slot()
+            try:
+                return super().request(*args, **kwargs)
+            except APIResponseError as error:
+                if (
+                    getattr(error, "code", None) != APIErrorCode.RateLimited
+                    or attempt >= self._max_rate_limit_retries
+                ):
+                    raise
+                time.sleep(_rate_limit_wait_seconds(error, attempt))
+        raise AssertionError("unreachable")
 
 
 class NotionHelper:
@@ -35,8 +87,8 @@ class NotionHelper:
         "ACTOR_DATABASE_NAME": "演员",
         "AUTHOR_DATABASE_NAME": "作者",
     }
-    database_id_dict = {}
     image_dict = {}
+
     def __init__(self,type):
         is_movie = True if type=="movie" else False
         page_url = os.getenv("NOTION_MOVIE_URL") if is_movie else os.getenv("NOTION_BOOK_URL")
@@ -46,18 +98,32 @@ class NotionHelper:
                 notion_token = os.getenv("MOVIE_NOTION_TOKEN")
             else:
                 notion_token = os.getenv("BOOK_NOTION_TOKEN")
-        self.client = Client(auth=notion_token, log_level=logging.ERROR)
+        self.client = RateLimitedNotionClient(
+            auth=notion_token,
+            log_level=logging.ERROR,
+        )
+        self.database_name_dict = dict(self.database_name_dict)
+        self.database_id_dict = {}
         self.__cache = {}
-        self.page_id = self.extract_page_id(page_url)
-        self.search_database(self.page_id)
+        self._database_properties_cache = {}
+        self.heatmap_block_id = None
+        self.page_id = self.extract_page_id(page_url) if page_url else None
+        if self.page_id:
+            self.search_database(self.page_id)
         for key in self.database_name_dict.keys():
             if os.getenv(key) != None and os.getenv(key) != "":
                 self.database_name_dict[key] = os.getenv(key)
-        self.book_database_id = self.database_id_dict.get(
-            self.database_name_dict.get("BOOK_DATABASE_NAME")
+        self.book_database_id = (
+            os.getenv("BOOK_DATABASE_ID")
+            or self.database_id_dict.get(
+                self.database_name_dict.get("BOOK_DATABASE_NAME")
+            )
         )
-        self.movie_database_id = self.database_id_dict.get(
-            self.database_name_dict.get("MOVIE_DATABASE_NAME")
+        self.movie_database_id = (
+            os.getenv("MOVIE_DATABASE_ID")
+            or self.database_id_dict.get(
+                self.database_name_dict.get("MOVIE_DATABASE_NAME")
+            )
         )
         self.day_database_id = self.database_id_dict.get(
             self.database_name_dict.get("DAY_DATABASE_NAME")
@@ -83,6 +149,16 @@ class NotionHelper:
         self.actor_database_id = self.database_id_dict.get(
             self.database_name_dict.get("ACTOR_DATABASE_NAME")
         )
+        required_database_id = (
+            self.movie_database_id if is_movie else self.book_database_id
+        )
+        self.target_database_id = required_database_id
+        if not required_database_id:
+            target = "电影" if is_movie else "书架"
+            raise ValueError(
+                f"未找到{target}数据库。请检查模板根页，"
+                f"或设置 {'MOVIE_DATABASE_ID' if is_movie else 'BOOK_DATABASE_ID'}。"
+            )
         if self.day_database_id:
             self.write_database_id(self.day_database_id)
         if is_movie:
@@ -116,7 +192,7 @@ class NotionHelper:
                     child.get("child_database").get("title")
                 ] = child.get("id")
             elif child["type"] == "embed" and child.get("embed").get("url"):
-                if child.get("embed").get("url").startswith("https://heatmap.malinkang.com/"):
+                if "heatmap" in child.get("embed").get("url"):
                     self.heatmap_block_id = child.get("id")
             # 如果子块有子块，递归调用函数
             if "has_children" in child and child["has_children"]:
@@ -159,32 +235,56 @@ class NotionHelper:
         properties = {
             "日期": get_date(format_date(date)),
         }
-        properties["年"] = get_relation(
-            [
-                self.get_year_relation_id(new_date),
-            ]
+        relation_getters = (
+            ("年", self.year_database_id, self.get_year_relation_id),
+            ("月", self.month_database_id, self.get_month_relation_id),
+            ("周", self.week_database_id, self.get_week_relation_id),
         )
-        properties["月"] = get_relation(
-            [
-                self.get_month_relation_id(new_date),
-            ]
-        )
-        properties["周"] = get_relation(
-            [
-                self.get_week_relation_id(new_date),
-            ]
-        )
+        for name, database_id, getter in relation_getters:
+            if database_id and self._supports_relation_property(
+                self.day_database_id, name
+            ):
+                properties[name] = get_relation([getter(new_date)])
         return self.get_relation_id(
             day, self.day_database_id, TARGET_ICON_URL, properties
         )
-    
+
+    def _get_database_properties(self, database_id):
+        if not database_id:
+            return {}
+        if database_id not in self._database_properties_cache:
+            response = self.client.databases.retrieve(database_id=database_id)
+            self._database_properties_cache[database_id] = (
+                response.get("properties") or {}
+            )
+        return self._database_properties_cache[database_id]
+
+    def _supports_relation_property(self, database_id, property_name):
+        property_definition = self._get_database_properties(database_id).get(
+            property_name
+        )
+        return (
+            property_definition is not None
+            and property_definition.get("type") == "relation"
+        )
+
+    def _filter_database_properties(self, database_id, properties):
+        database_properties = self._get_database_properties(database_id)
+        return {
+            name: value
+            for name, value in properties.items()
+            if name in database_properties
+            and isinstance(database_properties[name], dict)
+            and isinstance(value, dict)
+            and database_properties[name].get("type") in value
+        }
+
     def update_movie_database(self):
         """更新数据库"""
-        response = self.client.databases.retrieve(database_id=self.movie_database_id)
-        id = response.get("id")
-        properties = response.get("properties")
+        id = self.movie_database_id
+        properties = self._get_database_properties(id)
         update_properties = {}
-        if (
+        if self.actor_database_id and (
             properties.get("演员") is None
             or properties.get("演员").get("type") != "relation"
         ):
@@ -196,9 +296,13 @@ class NotionHelper:
             update_properties["IMDB"] = {"rich_text": {}}
         if len(update_properties) > 0:
             self.client.databases.update(database_id=id, properties=update_properties)
+            properties.update(update_properties)
     
     @retry(stop_max_attempt_number=3, wait_fixed=5000)
-    def get_relation_id(self, name, id, icon, properties={}):
+    def get_relation_id(self, name, id, icon, properties=None):
+        if not id:
+            return None
+        properties = dict(properties or {})
         key = f"{id}{name}"
         if key in self.__cache:
             return self.__cache.get(key)
@@ -219,17 +323,31 @@ class NotionHelper:
 
     @retry(stop_max_attempt_number=3, wait_fixed=5000)
     def update_book_page(self, page_id, properties):
-        return self.client.pages.update(page_id=page_id, properties=properties)
+        return self.client.pages.update(
+            page_id=page_id,
+            properties=self._filter_database_properties(
+                self.target_database_id, properties
+            ),
+        )
 
     @retry(stop_max_attempt_number=3, wait_fixed=5000)
     def update_page(self, page_id, properties):
         return self.client.pages.update(
-            page_id=page_id, properties=properties
+            page_id=page_id,
+            properties=self._filter_database_properties(
+                self.target_database_id, properties
+            ),
         )
 
     @retry(stop_max_attempt_number=3, wait_fixed=5000)
     def create_page(self, parent, properties, icon):
-        return self.client.pages.create(parent=parent, properties=properties, icon=icon)
+        return self.client.pages.create(
+            parent=parent,
+            properties=self._filter_database_properties(
+                parent.get("database_id"), properties
+            ),
+            icon=icon,
+        )
 
     @retry(stop_max_attempt_number=3, wait_fixed=5000)
     def query(self, **kwargs):
@@ -291,23 +409,14 @@ class NotionHelper:
         return results
 
     def get_date_relation(self, properties, date):
-        properties["年"] = get_relation(
-            [
-                self.get_year_relation_id(date),
-            ]
+        relation_getters = (
+            ("年", self.year_database_id, self.get_year_relation_id),
+            ("月", self.month_database_id, self.get_month_relation_id),
+            ("周", self.week_database_id, self.get_week_relation_id),
+            ("日", self.day_database_id, self.get_day_relation_id),
         )
-        properties["月"] = get_relation(
-            [
-                self.get_month_relation_id(date),
-            ]
-        )
-        properties["周"] = get_relation(
-            [
-                self.get_week_relation_id(date),
-            ]
-        )
-        properties["日"] = get_relation(
-            [
-                self.get_day_relation_id(date),
-            ]
-        )
+        for name, database_id, getter in relation_getters:
+            if database_id and self._supports_relation_property(
+                self.target_database_id, name
+            ):
+                properties[name] = get_relation([getter(date)])

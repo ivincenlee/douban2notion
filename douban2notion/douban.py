@@ -34,41 +34,110 @@ book_status = {
     "done": "读过",
 }
 AUTH_TOKEN = os.getenv("AUTH_TOKEN")
+DOUBAN_REQUEST_TIMEOUT = (10, 30)
 
 headers = {
     "host": DOUBAN_API_HOST,
-    "authorization": f"Bearer {AUTH_TOKEN}" if AUTH_TOKEN else "",
-    "user-agent": "User-Agent: Mozilla/5.0 (iPhone; CPU iPhone OS 15_3 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148 MicroMessenger/8.0.16(0x18001023) NetType/WIFI Language/zh_CN",
+    "user-agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 15_3 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148 MicroMessenger/8.0.16(0x18001023) NetType/WIFI Language/zh_CN",
     "referer": "https://servicewechat.com/wx2f9b06c1de1ccfca/84/page-frame.html",
 }
+INVALID_TOKEN_CODES = {103, 106, 109, 111, 112}
+
+
+class DoubanApiError(RuntimeError):
+    pass
+
+
+def _request_headers(use_token):
+    request_headers = dict(headers)
+    if use_token and AUTH_TOKEN:
+        request_headers["authorization"] = f"Bearer {AUTH_TOKEN}"
+    return request_headers
+
+
+def _response_error_code(response):
+    try:
+        payload = response.json()
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    code = payload.get("code")
+    if isinstance(code, bool):
+        return None
+    if isinstance(code, int):
+        return code
+    if isinstance(code, str) and code.isdigit() and len(code) <= 6:
+        return int(code)
+    return None
+
+
+def _fetch_interest_page(user, type_, status, offset):
+    url = f"https://{DOUBAN_API_HOST}/api/v2/user/{user}/interests"
+    params = {
+        "type": type_,
+        "count": 50,
+        "status": status,
+        "start": offset,
+        "apikey": DOUBAN_API_KEY,
+    }
+    response = requests.get(
+        url,
+        headers=_request_headers(True),
+        params=params,
+        timeout=DOUBAN_REQUEST_TIMEOUT,
+    )
+    error_code = None if response.ok else _response_error_code(response)
+    if (
+        not response.ok
+        and AUTH_TOKEN
+        and (
+            response.status_code == 401
+            or error_code in INVALID_TOKEN_CODES
+        )
+    ):
+        # Public interests remain available when a saved mobile token expires.
+        response = requests.get(
+            url,
+            headers=_request_headers(False),
+            params=params,
+            timeout=DOUBAN_REQUEST_TIMEOUT,
+        )
+        error_code = None if response.ok else _response_error_code(response)
+    if not response.ok:
+        code_detail = f", code={error_code}" if error_code is not None else ""
+        raise DoubanApiError(
+            f"Douban interests request failed with HTTP {response.status_code}{code_detail}"
+        )
+    payload = response.json()
+    interests = payload.get("interests") if isinstance(payload, dict) else None
+    if not isinstance(interests, list):
+        raise DoubanApiError("Douban interests response is missing a list")
+    return interests
+
+
 @retry(stop_max_attempt_number=3, wait_fixed=5000)
 def fetch_subjects(user, type_, status):
     offset = 0
     page = 0
-    url = f"https://{DOUBAN_API_HOST}/api/v2/user/{user}/interests"
-    total = 0
     results = []
     while True:
-        params = {
-            "type": type_,
-            "count": 50,
-            "status": status,
-            "start": offset,
-            "apiKey": DOUBAN_API_KEY,
-        }
-        response = requests.get(url, headers=headers, params=params)
-        
-        if response.ok:
-            response = response.json()
-            interests = response.get("interests")
-            if len(interests)==0:
-                break
-            results.extend(interests)
-            print(f"total = {total}")
-            print(f"size = {len(results)}")
-            page += 1
-            offset = page * 50
+        interests = _fetch_interest_page(user, type_, status, offset)
+        if not interests:
+            break
+        results.extend(interests)
+        print(f"size = {len(results)}")
+        page += 1
+        offset = page * 50
     return results
+
+
+def _notion_item_key(link, title):
+    for kind, value in (("url", link), ("title", title)):
+        normalized = str(value or "").strip()
+        if normalized:
+            return kind, normalized
+    return None
 
 
 
@@ -79,15 +148,17 @@ def insert_movie(douban_name,notion_helper):
         movie = {}
         for key, value in i.get("properties").items():
             movie[key] = utils.get_property_value(value)
-        notion_movie_dict[movie.get("豆瓣链接")] = {
-            "短评": movie.get("短评"),
-            "状态": movie.get("状态"),
-            "日期": movie.get("日期"),
-            "评分": movie.get("评分"),
-            "演员": movie.get("演员"),
-            "IMDB": movie.get("IMDB"),
-            "page_id": i.get("id")
-        }
+        item_key = _notion_item_key(movie.get("豆瓣链接"), movie.get("电影名"))
+        if item_key:
+            notion_movie_dict[item_key] = {
+                "短评": movie.get("短评"),
+                "状态": movie.get("状态"),
+                "日期": movie.get("日期"),
+                "评分": movie.get("评分"),
+                "演员": movie.get("演员"),
+                "IMDB": movie.get("IMDB"),
+                "page_id": i.get("id")
+            }
     results = []
     for i in movie_status.keys():
         results.extend(fetch_subjects(douban_name, "movie", i))
@@ -109,8 +180,9 @@ def insert_movie(douban_name,notion_helper):
             movie["评分"] = rating.get(result.get("rating").get("value"))
         if result.get("comment"):
             movie["短评"] = result.get("comment")
-        if notion_movie_dict.get(movie.get("豆瓣链接")):
-            notion_movive = notion_movie_dict.get(movie.get("豆瓣链接"))
+        item_key = _notion_item_key(movie.get("豆瓣链接"), movie.get("电影名"))
+        if item_key and notion_movie_dict.get(item_key):
+            notion_movive = notion_movie_dict.get(item_key)
             if (
                 notion_movive.get("日期") != movie.get("日期")
                 or notion_movive.get("短评") != movie.get("短评")
@@ -190,14 +262,22 @@ def insert_movie(douban_name,notion_helper):
                 parent=parent, properties=properties, icon=get_icon(cover)
             )
 def get_imdb(link):
+    if not link:
+        return None
     headers = {'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/104.0.0.0 Safari/537.36'}
-    response = requests.get(link, headers=headers)
-    soup = BeautifulSoup(response.content)
+    try:
+        response = requests.get(link, headers=headers, timeout=DOUBAN_REQUEST_TIMEOUT)
+        response.raise_for_status()
+    except requests.RequestException:
+        # IMDb is optional enrichment; anti-bot responses must not discard the sync.
+        return None
+    soup = BeautifulSoup(response.content, features="lxml")
     info = soup.find(id='info')
     if info:
         for span in info.find_all('span', {'class': 'pl'}):
-            if ('IMDb:' == span.string):
+            if ('IMDb:' == span.string and span.next_sibling):
                 return span.next_sibling.string.strip()
+    return None
 
 def insert_book(douban_name,notion_helper):
     notion_books = notion_helper.query_all(database_id=notion_helper.book_database_id)
@@ -206,14 +286,16 @@ def insert_book(douban_name,notion_helper):
         book = {}
         for key, value in i.get("properties").items():
             book[key] = utils.get_property_value(value)
-        notion_book_dict[book.get("豆瓣链接")] = {
-            "短评": book.get("短评"),
-            "状态": book.get("状态"),
-            "日期": book.get("日期"),
-            "评分": book.get("评分"),
-            "封面": book.get("封面"),
-            "page_id": i.get("id"),
-        }
+        item_key = _notion_item_key(book.get("豆瓣链接"), book.get("书名"))
+        if item_key:
+            notion_book_dict[item_key] = {
+                "短评": book.get("短评"),
+                "状态": book.get("状态"),
+                "日期": book.get("日期"),
+                "评分": book.get("评分"),
+                "封面": book.get("封面"),
+                "page_id": i.get("id"),
+            }
         print(i)
     print(f"notion {len(notion_book_dict)}")
     results = []
@@ -240,8 +322,9 @@ def insert_book(douban_name,notion_helper):
             book["评分"] = rating.get(result.get("rating").get("value"))
         if result.get("comment"):
             book["短评"] = result.get("comment")
-        if notion_book_dict.get(book.get("豆瓣链接")):
-            notion_movive = notion_book_dict.get(book.get("豆瓣链接"))
+        item_key = _notion_item_key(book.get("豆瓣链接"), book.get("书名"))
+        if item_key and notion_book_dict.get(item_key):
+            notion_movive = notion_book_dict.get(item_key)
             if (
                 notion_movive.get("封面") is None
                 or notion_movive.get("封面") != book.get("封面")
